@@ -1,4 +1,5 @@
 import logging
+import os
 import shutil
 from datetime import datetime, timezone
 
@@ -149,14 +150,22 @@ def disk():
     except DockerException as exc:
         return _error(503, "docker_unavailable", str(exc))
 
-    # Host disk usage (the root filesystem visible to the container)
-    usage = shutil.disk_usage("/")
-    disk_info = {
-        "total_gb": round(usage.total / 1024 / 1024 / 1024, 1),
-        "used_gb": round(usage.used / 1024 / 1024 / 1024, 1),
-        "free_gb": round(usage.free / 1024 / 1024 / 1024, 1),
-        "percent_used": round(usage.used / usage.total * 100, 1),
-    }
+    # Filesystems: root + any extra mounts (e.g. /host/data for RAID)
+    disks = []
+    mounts = [("/", "System (SSD)")]
+    if os.path.isdir("/host/data"):
+        mounts.append(("/host/data", "Data (RAID1)"))
+
+    for path, label in mounts:
+        usage = shutil.disk_usage(path)
+        disks.append({
+            "label": label,
+            "mount": path,
+            "total_gb": round(usage.total / 1024 / 1024 / 1024, 1),
+            "used_gb": round(usage.used / 1024 / 1024 / 1024, 1),
+            "free_gb": round(usage.free / 1024 / 1024 / 1024, 1),
+            "percent_used": round(usage.used / usage.total * 100, 1),
+        })
 
     # Docker system disk usage (images, containers, volumes)
     try:
@@ -179,7 +188,7 @@ def disk():
     total_image_size = sum(img.get("Size", 0) for img in images)
 
     return {
-        "disk": disk_info,
+        "disks": disks,
         "volumes": volumes,
         "images": {
             "total_count": len(images),
