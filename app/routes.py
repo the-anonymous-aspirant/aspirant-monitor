@@ -173,7 +173,7 @@ def disk():
     except DockerException:
         df = {}
 
-    # Volumes
+    # Docker named volumes
     volumes = []
     for v in df.get("Volumes", []):
         volumes.append({
@@ -181,6 +181,26 @@ def disk():
             "size_mb": round(v.get("UsageData", {}).get("Size", 0) / 1024 / 1024, 1),
             "ref_count": v.get("UsageData", {}).get("RefCount", 0),
         })
+
+    # Bind mount directories on /data/aspirant (visible at /host/data/aspirant)
+    bind_base = "/host/data/aspirant"
+    if os.path.isdir(bind_base):
+        for name in sorted(os.listdir(bind_base)):
+            dirpath = os.path.join(bind_base, name)
+            if os.path.isdir(dirpath):
+                total = 0
+                for root, _dirs, files in os.walk(dirpath):
+                    total += sum(
+                        os.path.getsize(os.path.join(root, f))
+                        for f in files
+                        if os.path.isfile(os.path.join(root, f))
+                    )
+                volumes.append({
+                    "name": f"/data/aspirant/{name}",
+                    "size_mb": round(total / 1024 / 1024, 1),
+                    "ref_count": -1,
+                })
+
     volumes.sort(key=lambda v: v["size_mb"], reverse=True)
 
     # Images summary
