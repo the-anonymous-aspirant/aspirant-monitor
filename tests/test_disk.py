@@ -18,8 +18,9 @@ def test_disk_info(client, mock_docker):
     resp = client.get("/disk")
     assert resp.status_code == 200
     data = resp.json()
-    assert "disk" in data
-    assert data["disk"]["total_gb"] > 0
+    assert "disks" in data
+    assert len(data["disks"]) >= 1
+    assert data["disks"][0]["total_gb"] > 0
     assert len(data["volumes"]) == 1
     assert data["volumes"][0]["name"] == "aspirant-online_pgdata"
     assert data["images"]["total_count"] == 2
