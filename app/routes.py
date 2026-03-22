@@ -9,6 +9,8 @@ from fastapi import APIRouter
 from starlette.responses import JSONResponse
 
 from app.config import MONITOR_VERSION, SERVICE_NAME
+from app.scheduler import get_scheduler_status
+from app.daily_report import generate_report
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -215,3 +217,13 @@ def disk():
             "total_size_mb": round(total_image_size / 1024 / 1024, 1),
         },
     }
+
+
+@router.get("/report/status")
+def report_status():
+    return get_scheduler_status()
+
+
+@router.get("/report/preview")
+def report_preview():
+    return {"report": generate_report()}
