@@ -18,8 +18,8 @@ from app.config import (
 logger = logging.getLogger(__name__)
 
 
-async def send_email(subject: str, body: str) -> bool:
-    """Send a plain-text email. Returns True on success, False on failure."""
+async def send_email(subject: str, body: str, html: str | None = None) -> bool:
+    """Send an email. If *html* is provided, send as multipart with plain-text fallback."""
     if not email_enabled():
         logger.info("Email not configured, skipping: %s", subject)
         return False
@@ -29,6 +29,8 @@ async def send_email(subject: str, body: str) -> bool:
     msg["From"] = ALERT_EMAIL_FROM
     msg["To"] = ALERT_EMAIL_TO
     msg.set_content(body)
+    if html:
+        msg.add_alternative(html, subtype="html")
 
     try:
         await aiosmtplib.send(
