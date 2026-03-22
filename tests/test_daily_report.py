@@ -1,11 +1,11 @@
 from unittest.mock import patch, MagicMock
 
-from app.daily_report import generate_report, generate_report_html, _status_color
+from app.daily_report import generate_report, generate_report_html, _status_color, THRESHOLDS
 
 
 MOCK_CONTAINERS = [
-    {"name": "client", "status": "running", "cpu": "0.1%", "mem": "42 MB", "mem_mb": 42.0, "uptime": "12d 4h"},
-    {"name": "server", "status": "running", "cpu": "1.2%", "mem": "128 MB", "mem_mb": 128.0, "uptime": "12d 4h"},
+    {"name": "client", "status": "running", "cpu": "0.1%", "mem": "42 MB", "mem_mb": 42.0, "mem_limit_mb": 512.0, "mem_percent": 8.2, "uptime": "12d 4h"},
+    {"name": "server", "status": "running", "cpu": "1.2%", "mem": "128 MB", "mem_mb": 128.0, "mem_limit_mb": 512.0, "mem_percent": 25.0, "uptime": "12d 4h"},
 ]
 
 MOCK_METRICS = {
@@ -41,6 +41,16 @@ class TestStatusColor:
 
     def test_red_at_critical(self):
         assert _status_color(4.5, "cpu_load_15m") == "red"
+
+    def test_container_mem_uses_percentage(self):
+        assert "container_mem_percent" in THRESHOLDS
+        assert "container_mem_mb" not in THRESHOLDS
+        # 50% of limit = green
+        assert _status_color(50.0, "container_mem_percent") == "green"
+        # 80% of limit = orange
+        assert _status_color(80.0, "container_mem_percent") == "orange"
+        # 95% of limit = red
+        assert _status_color(95.0, "container_mem_percent") == "red"
 
     def test_none_value_returns_green(self):
         assert _status_color(None, "cpu_load_15m") == "green"

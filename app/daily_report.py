@@ -20,7 +20,7 @@ THRESHOLDS = {
     "memory_percent": (70.0, 90.0),
     "disk_percent": (75.0, 90.0),
     "temperature_c": (65, 80),
-    "container_mem_mb": (1800, 2400),
+    "container_mem_percent": (75.0, 90.0),
 }
 
 
@@ -97,19 +97,30 @@ def _collect_container_stats() -> list[dict]:
 
                 mem_stats = stats.get("memory_stats", {})
                 mem_usage = mem_stats.get("usage", 0)
+                mem_limit = mem_stats.get("limit", 0)
                 cache = mem_stats.get("stats", {}).get("cache", 0)
                 mem_used = mem_usage - cache
                 mem_mb = mem_used / 1024 / 1024
+                mem_limit_mb = mem_limit / 1024 / 1024
                 info["mem"] = f"{mem_mb:.0f} MB"
                 info["mem_mb"] = mem_mb
+                info["mem_limit_mb"] = mem_limit_mb
+                if mem_limit > 0:
+                    info["mem_percent"] = round(mem_used / mem_limit * 100, 1)
+                else:
+                    info["mem_percent"] = None
             except Exception:
                 info["cpu"] = "?"
                 info["mem"] = "?"
                 info["mem_mb"] = None
+                info["mem_limit_mb"] = None
+                info["mem_percent"] = None
         else:
             info["cpu"] = "-"
             info["mem"] = "-"
             info["mem_mb"] = None
+            info["mem_limit_mb"] = None
+            info["mem_percent"] = None
 
         results.append(info)
 
@@ -313,7 +324,7 @@ def generate_report_html() -> str:
 
         if c["status"] == "running":
             status_dot = _dot("green")
-            mem_color = _status_color(c.get("mem_mb"), "container_mem_mb")
+            mem_color = _status_color(c.get("mem_percent"), "container_mem_percent")
             mem_html = f'{_dot(mem_color)} {c["mem"]}'
             row_class = ""
         else:
@@ -333,7 +344,7 @@ def generate_report_html() -> str:
     html_parts.append(f'<tr><td>Memory</td><td>&lt; {THRESHOLDS["memory_percent"][0]}%</td><td>&ge; {THRESHOLDS["memory_percent"][0]}%</td><td>&ge; {THRESHOLDS["memory_percent"][1]}%</td></tr>')
     html_parts.append(f'<tr><td>Disk</td><td>&lt; {THRESHOLDS["disk_percent"][0]}%</td><td>&ge; {THRESHOLDS["disk_percent"][0]}%</td><td>&ge; {THRESHOLDS["disk_percent"][1]}%</td></tr>')
     html_parts.append(f'<tr><td>Temperature</td><td>&lt; {THRESHOLDS["temperature_c"][0]} C</td><td>&ge; {THRESHOLDS["temperature_c"][0]} C</td><td>&ge; {THRESHOLDS["temperature_c"][1]} C</td></tr>')
-    html_parts.append(f'<tr><td>Container Mem</td><td>&lt; {THRESHOLDS["container_mem_mb"][0]} MB</td><td>&ge; {THRESHOLDS["container_mem_mb"][0]} MB</td><td>&ge; {THRESHOLDS["container_mem_mb"][1]} MB</td></tr>')
+    html_parts.append(f'<tr><td>Container Mem</td><td>&lt; {THRESHOLDS["container_mem_percent"][0]}% of limit</td><td>&ge; {THRESHOLDS["container_mem_percent"][0]}% of limit</td><td>&ge; {THRESHOLDS["container_mem_percent"][1]}% of limit</td></tr>')
     html_parts.append('</table></div>')
 
     html_parts.append('<div class="footer">aspirant-monitor &middot; aspirant-cell</div>')
