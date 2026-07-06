@@ -8,7 +8,7 @@ from docker.errors import DockerException
 from fastapi import APIRouter
 from starlette.responses import JSONResponse
 
-from app.config import MONITOR_VERSION, SERVICE_NAME
+from app.config import DOCKER_SOCKET, MONITOR_VERSION, SERVICE_NAME
 from app.scheduler import get_scheduler_status
 from app.daily_report import generate_report
 
@@ -17,7 +17,7 @@ router = APIRouter()
 
 
 def _get_client():
-    return docker.DockerClient(base_url="unix:///var/run/docker.sock")
+    return docker.DockerClient(base_url=DOCKER_SOCKET)
 
 
 def _error(status_code: int, code: str, message: str) -> JSONResponse:
