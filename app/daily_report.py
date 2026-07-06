@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import docker
 from docker.errors import DockerException
 
+from app.config import DOCKER_SOCKET
 from app.system_metrics import get_uptime, get_load_average, get_memory, get_temperature
 from app.email import send_email
 
@@ -46,7 +47,7 @@ def _dot(color: str) -> str:
 def _collect_container_stats() -> list[dict]:
     """Collect stats for all containers. Returns list of dicts."""
     try:
-        client = docker.DockerClient(base_url="unix:///var/run/docker.sock")
+        client = docker.DockerClient(base_url=DOCKER_SOCKET)
     except DockerException as exc:
         logger.error("Docker unavailable for daily report: %s", exc)
         return []
