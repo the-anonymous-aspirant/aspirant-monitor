@@ -4,13 +4,23 @@ import logging
 import shutil
 import os
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 import docker
 from docker.errors import DockerException
 
-from app.config import DOCKER_SOCKET
+from app.config import DOCKER_SOCKET, MIN_EXPECTED_CONTAINERS
 from app.system_metrics import get_uptime, get_load_average, get_memory, get_temperature
 from app.email import send_email
+
+
+class ContainerStats(NamedTuple):
+    """Result of container enumeration. `docker_error` is populated when the
+    Docker socket is unreachable; the report must then fail CLOSED with a
+    CRITICAL alert rather than treating an empty list as 'all healthy'."""
+
+    items: list[dict]
+    docker_error: str | None
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +54,20 @@ def _dot(color: str) -> str:
     return f'<span style="color:{hex_color};font-size:18px;">&#9679;</span>'
 
 
-def _collect_container_stats() -> list[dict]:
-    """Collect stats for all containers. Returns list of dicts."""
+def _collect_container_stats() -> ContainerStats:
+    """Collect stats for all containers.
+
+    Returns a `ContainerStats(items, docker_error)`. When the Docker socket is
+    unreachable, `docker_error` carries the exception text and `items` is
+    empty — callers must treat this as a fail-CLOSED signal (see
+    `generate_report`/`generate_report_html`), never as "no containers exist".
+    """
     try:
         client = docker.DockerClient(base_url=DOCKER_SOCKET)
+        client.ping()
     except DockerException as exc:
         logger.error("Docker unavailable for daily report: %s", exc)
-        return []
+        return ContainerStats(items=[], docker_error=str(exc) or exc.__class__.__name__)
 
     results = []
     for container in client.containers.list(all=True):
@@ -126,7 +143,25 @@ def _collect_container_stats() -> list[dict]:
         results.append(info)
 
     results.sort(key=lambda c: (0 if c["status"] == "running" else 1, c["name"]))
-    return results
+    return ContainerStats(items=results, docker_error=None)
+
+
+def _blindness_alert(stats: ContainerStats) -> str | None:
+    """Return a fail-CLOSED alert string if the monitor cannot trust its
+    container enumeration, else None.
+
+    A blind monitor that reports 'all healthy' is worse than no monitor at
+    all — the operator's daily report has no other signal that the docker
+    socket is unreachable. See task #1875.
+    """
+    if stats.docker_error is not None:
+        return f"MONITOR BLIND: cannot reach Docker socket ({stats.docker_error})"
+    if len(stats.items) < MIN_EXPECTED_CONTAINERS:
+        return (
+            f"MONITOR BLIND: only {len(stats.items)} containers visible, "
+            f"expected >= {MIN_EXPECTED_CONTAINERS} (set MIN_EXPECTED_CONTAINERS to adjust)"
+        )
+    return None
 
 
 def _collect_disk_info() -> list[dict]:
@@ -189,7 +224,12 @@ def generate_report() -> str:
     lines.append(f"  Temperature:  {temp}")
     lines.append("")
 
-    containers = _collect_container_stats()
+    stats = _collect_container_stats()
+    blindness = _blindness_alert(stats)
+    if blindness:
+        lines.append(f"[CRITICAL] {blindness}")
+
+    containers = stats.items
     running = sum(1 for c in containers if c["status"] == "running")
     total = len(containers)
     lines.append(f"Containers ({running}/{total} running)")
@@ -216,12 +256,19 @@ def generate_report_html() -> str:
     disks = _collect_disk_info()
     temp_str = get_temperature()
     temp_c = _parse_temperature(temp_str)
-    containers = _collect_container_stats()
+    stats = _collect_container_stats()
+    blindness = _blindness_alert(stats)
+    containers = stats.items
     running = sum(1 for c in containers if c["status"] == "running")
     total = len(containers)
 
-    # Determine overall status
+    # Determine overall status. A blindness signal (docker socket unreachable
+    # or too few containers visible) is a CRITICAL RED alert that overrides
+    # "all healthy" — a monitor that reports green while blind is worse than
+    # no monitor at all.
     alerts = []
+    if blindness:
+        alerts.append(blindness)
     if load["load_15m"] is not None and _status_color(load["load_15m"], "cpu_load_15m") != "green":
         alerts.append(f"CPU load 15m: {load['load_15m']}")
     if mem["percent"] is not None and _status_color(mem["percent"], "memory_percent") != "green":
@@ -236,10 +283,14 @@ def generate_report_html() -> str:
         alerts.append(f"Container down: {c['name']}")
 
     if alerts:
-        overall_color = "red" if any("down" in a for a in alerts) else "orange"
+        overall_color = (
+            "red"
+            if (blindness or any("down" in a for a in alerts))
+            else "orange"
+        )
         banner_bg = "#fdf2f2" if overall_color == "red" else "#fef9e7"
         banner_border = "#e74c3c" if overall_color == "red" else "#f39c12"
-        banner_text = "Needs attention"
+        banner_text = "Monitor blind" if blindness else "Needs attention"
     else:
         banner_bg = "#eafaf1"
         banner_border = "#2ecc71"
@@ -280,7 +331,7 @@ def generate_report_html() -> str:
     <div class="date">{now.strftime('%A, %B %d, %Y')}</div>
 </div>
 <div class="banner" style="background:{banner_bg};border-color:{banner_border};">
-    {_dot("green" if not alerts else ("red" if "down" in str(alerts) else "orange"))} {banner_text}"""]
+    {_dot("green" if not alerts else ("red" if (blindness or "down" in str(alerts)) else "orange"))} {banner_text}"""]
 
     if alerts:
         html_parts.append('<div style="margin-top:6px;">')
@@ -312,7 +363,10 @@ def generate_report_html() -> str:
     html_parts.append('</div>')
 
     # Containers section
-    html_parts.append(f'<div class="section"><h2>Containers ({running}/{total} running)</h2>')
+    heading_prefix = f"{_dot('red')} MONITOR BLIND &mdash; " if blindness else ""
+    html_parts.append(
+        f'<div class="section"><h2>{heading_prefix}Containers ({running}/{total} running)</h2>'
+    )
     html_parts.append('<table><tr><th>Name</th><th>Status</th><th>CPU</th><th>Memory</th><th>Uptime</th></tr>')
 
     for c in containers:
