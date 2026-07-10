@@ -1,12 +1,24 @@
 from unittest.mock import patch, MagicMock
 
-from app.daily_report import generate_report, generate_report_html, _status_color, THRESHOLDS
+from docker.errors import DockerException
+
+from app.daily_report import (
+    ContainerStats,
+    _blindness_alert,
+    _collect_container_stats,
+    _status_color,
+    generate_report,
+    generate_report_html,
+    THRESHOLDS,
+)
 
 
 MOCK_CONTAINERS = [
     {"name": "client", "status": "running", "cpu": "0.1%", "mem": "42 MB", "mem_mb": 42.0, "mem_limit_mb": 512.0, "mem_percent": 8.2, "uptime": "12d 4h"},
     {"name": "server", "status": "running", "cpu": "1.2%", "mem": "128 MB", "mem_mb": 128.0, "mem_limit_mb": 512.0, "mem_percent": 25.0, "uptime": "12d 4h"},
 ]
+MOCK_STATS_HEALTHY = ContainerStats(items=MOCK_CONTAINERS, docker_error=None)
+MOCK_STATS_EMPTY = ContainerStats(items=[], docker_error=None)
 
 MOCK_METRICS = {
     "temp": "52 C",
@@ -25,7 +37,7 @@ def _apply_patches(func):
         patch("app.daily_report.get_load_average", return_value=MOCK_METRICS["load"]),
         patch("app.daily_report.get_uptime", return_value=MOCK_METRICS["uptime"]),
         patch("app.daily_report._collect_disk_info", return_value=MOCK_METRICS["disk"]),
-        patch("app.daily_report._collect_container_stats", return_value=MOCK_CONTAINERS),
+        patch("app.daily_report._collect_container_stats", return_value=MOCK_STATS_HEALTHY),
     ]
     for p in reversed(patches):
         func = p(func)
@@ -79,7 +91,7 @@ class TestGenerateReport:
     @patch("app.daily_report.get_load_average", return_value={"load_1m": None, "load_5m": None, "load_15m": None})
     @patch("app.daily_report.get_uptime", return_value="unavailable")
     @patch("app.daily_report._collect_disk_info", return_value=[])
-    @patch("app.daily_report._collect_container_stats", return_value=[])
+    @patch("app.daily_report._collect_container_stats", return_value=MOCK_STATS_EMPTY)
     def test_report_handles_unavailable_metrics(self, *_):
         report = generate_report()
 
@@ -112,7 +124,7 @@ class TestGenerateReportHtml:
     @patch("app.daily_report.get_load_average", return_value={"load_1m": 5.0, "load_5m": 4.5, "load_15m": 4.2})
     @patch("app.daily_report.get_uptime", return_value="1 day")
     @patch("app.daily_report._collect_disk_info", return_value=[{"label": "SSD", "total_gb": 50.0, "used_gb": 48.0, "percent": 96.0}])
-    @patch("app.daily_report._collect_container_stats", return_value=MOCK_CONTAINERS)
+    @patch("app.daily_report._collect_container_stats", return_value=MOCK_STATS_HEALTHY)
     def test_html_shows_warnings_for_high_values(self, *_):
         html = generate_report_html()
         assert "Needs attention" in html
@@ -131,3 +143,126 @@ class TestReportEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert "enabled" in data
+
+
+# --- Regression: fail-CLOSED on Docker blindness (task 1875) -----------------
+#
+# The 2026-07-09 daily report showed "Containers (0/0 running)" AND "All
+# systems healthy" for ~2 days while the docker-socket-proxy was down. Every
+# test below guards against that fail-OPEN behaviour re-appearing.
+
+
+class TestCollectContainerStatsFailsClosed:
+    def test_returns_error_string_when_docker_unavailable(self):
+        with patch("app.daily_report.docker.DockerClient") as mock_ctor:
+            mock_ctor.side_effect = DockerException("connection refused")
+            stats = _collect_container_stats()
+
+        assert stats.items == []
+        assert stats.docker_error is not None
+        assert "connection refused" in stats.docker_error
+
+    def test_returns_error_string_when_ping_fails(self):
+        with patch("app.daily_report.docker.DockerClient") as mock_ctor:
+            mock_client = MagicMock()
+            mock_client.ping.side_effect = DockerException("proxy unreachable")
+            mock_ctor.return_value = mock_client
+            stats = _collect_container_stats()
+
+        assert stats.items == []
+        assert stats.docker_error is not None
+        assert "proxy unreachable" in stats.docker_error
+
+    def test_returns_items_when_docker_healthy(self):
+        with patch("app.daily_report.docker.DockerClient") as mock_ctor:
+            mock_client = MagicMock()
+            mock_client.containers.list.return_value = []
+            mock_ctor.return_value = mock_client
+            stats = _collect_container_stats()
+
+        assert stats.items == []
+        assert stats.docker_error is None
+
+
+class TestBlindnessAlert:
+    def test_docker_error_triggers_alert(self):
+        stats = ContainerStats(items=[], docker_error="connection refused")
+        alert = _blindness_alert(stats)
+        assert alert is not None
+        assert "MONITOR BLIND" in alert
+        assert "connection refused" in alert
+
+    def test_below_min_triggers_alert(self):
+        with patch("app.daily_report.MIN_EXPECTED_CONTAINERS", 3):
+            stats = ContainerStats(items=[{"name": "only-one"}], docker_error=None)
+            alert = _blindness_alert(stats)
+        assert alert is not None
+        assert "MONITOR BLIND" in alert
+        assert "only 1" in alert
+
+    def test_at_or_above_min_no_alert(self):
+        with patch("app.daily_report.MIN_EXPECTED_CONTAINERS", 2):
+            stats = ContainerStats(items=MOCK_CONTAINERS, docker_error=None)
+            alert = _blindness_alert(stats)
+        assert alert is None
+
+
+BLIND_STATS = ContainerStats(items=[], docker_error="proxy unreachable at tcp://docker-socket-proxy:2375")
+
+
+class TestReportFailsClosedOnBlindness:
+    @patch("app.daily_report.get_temperature", return_value=MOCK_METRICS["temp"])
+    @patch("app.daily_report.get_memory", return_value=MOCK_METRICS["memory"])
+    @patch("app.daily_report.get_load_average", return_value=MOCK_METRICS["load"])
+    @patch("app.daily_report.get_uptime", return_value=MOCK_METRICS["uptime"])
+    @patch("app.daily_report._collect_disk_info", return_value=MOCK_METRICS["disk"])
+    @patch("app.daily_report._collect_container_stats", return_value=BLIND_STATS)
+    def test_html_shows_critical_banner_when_docker_unreachable(self, *_):
+        html = generate_report_html()
+
+        # This is the load-bearing regression assertion: a blind monitor MUST
+        # NOT render as green/healthy. See task 1875.
+        assert "All systems healthy" not in html
+        assert "Monitor blind" in html
+        assert "MONITOR BLIND" in html
+        assert "proxy unreachable" in html
+        assert "#e74c3c" in html  # red banner border
+
+    @patch("app.daily_report.get_temperature", return_value=MOCK_METRICS["temp"])
+    @patch("app.daily_report.get_memory", return_value=MOCK_METRICS["memory"])
+    @patch("app.daily_report.get_load_average", return_value=MOCK_METRICS["load"])
+    @patch("app.daily_report.get_uptime", return_value=MOCK_METRICS["uptime"])
+    @patch("app.daily_report._collect_disk_info", return_value=MOCK_METRICS["disk"])
+    @patch("app.daily_report._collect_container_stats", return_value=BLIND_STATS)
+    def test_text_report_shows_critical_when_docker_unreachable(self, *_):
+        report = generate_report()
+
+        assert "[CRITICAL]" in report
+        assert "MONITOR BLIND" in report
+        assert "proxy unreachable" in report
+
+    @patch("app.daily_report.MIN_EXPECTED_CONTAINERS", 3)
+    @patch("app.daily_report.get_temperature", return_value=MOCK_METRICS["temp"])
+    @patch("app.daily_report.get_memory", return_value=MOCK_METRICS["memory"])
+    @patch("app.daily_report.get_load_average", return_value=MOCK_METRICS["load"])
+    @patch("app.daily_report.get_uptime", return_value=MOCK_METRICS["uptime"])
+    @patch("app.daily_report._collect_disk_info", return_value=MOCK_METRICS["disk"])
+    @patch("app.daily_report._collect_container_stats", return_value=MOCK_STATS_HEALTHY)
+    def test_html_fails_closed_when_below_min_expected(self, *_):
+        html = generate_report_html()
+
+        assert "All systems healthy" not in html
+        assert "Monitor blind" in html
+        assert "only 2 containers visible" in html
+
+    @patch("app.daily_report.MIN_EXPECTED_CONTAINERS", 2)
+    @patch("app.daily_report.get_temperature", return_value=MOCK_METRICS["temp"])
+    @patch("app.daily_report.get_memory", return_value=MOCK_METRICS["memory"])
+    @patch("app.daily_report.get_load_average", return_value=MOCK_METRICS["load"])
+    @patch("app.daily_report.get_uptime", return_value=MOCK_METRICS["uptime"])
+    @patch("app.daily_report._collect_disk_info", return_value=MOCK_METRICS["disk"])
+    @patch("app.daily_report._collect_container_stats", return_value=MOCK_STATS_HEALTHY)
+    def test_html_healthy_when_count_meets_min(self, *_):
+        html = generate_report_html()
+        assert "All systems healthy" in html
+        assert "Monitor blind" not in html

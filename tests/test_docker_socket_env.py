@@ -45,5 +45,7 @@ def test_daily_report_collect_uses_docker_socket_env(monkeypatch):
 
     with patch("docker.DockerClient") as mock_ctor:
         mock_ctor.return_value.containers.list.return_value = []
-        daily_report._collect_container_stats()
+        stats = daily_report._collect_container_stats()
         mock_ctor.assert_called_once_with(base_url="tcp://docker-socket-proxy:2375")
+        assert stats.docker_error is None
+        assert stats.items == []

@@ -23,6 +23,7 @@ docker run -v /var/run/docker.sock:/var/run/docker.sock -p 8085:8000 aspirant-mo
 |----------|---------|-------------|
 | `MONITOR_VERSION` | `0.1.0` | Reported version in health endpoint |
 | `DOCKER_SOCKET` | `unix:///var/run/docker.sock` | Docker socket path |
+| `MIN_EXPECTED_CONTAINERS` | `1` | Fail-CLOSED floor — daily report alerts CRITICAL when fewer containers are visible |
 
 ## Testing
 

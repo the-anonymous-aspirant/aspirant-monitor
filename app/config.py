@@ -4,6 +4,13 @@ SERVICE_NAME = "monitor"
 MONITOR_VERSION = os.getenv("MONITOR_VERSION", "0.2.0")
 DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "unix:///var/run/docker.sock")
 
+# Fail-CLOSED self-check: minimum number of containers the monitor expects to
+# see. If fewer are visible (including zero when the Docker socket is
+# unreachable), the daily report renders a CRITICAL blindness alert rather
+# than falsely reporting "All systems healthy". The monitor itself runs in a
+# container, so 1 is a safe floor on the deployed stack.
+MIN_EXPECTED_CONTAINERS = int(os.getenv("MIN_EXPECTED_CONTAINERS", "1"))
+
 # SMTP configuration (all optional — if SMTP_HOST is unset, email is disabled)
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
