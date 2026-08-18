@@ -32,10 +32,27 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # `type=sha` emits `sha-<short7>`, which is the identity system_3's
+      # deploy-freshness sweep asserts (scripts/deploy_freshness_sweep.py:190
+      # and fetch_head_sha, which truncates origin/main's HEAD to 7 chars).
+      # Publishing only `:latest` left this service reading "never published
+      # (no image for HEAD)" even when the image was fresh, because a moving
+      # tag cannot answer "is THIS commit published". Same three rules
+      # aspirant-server / -client / -commander already use.
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
       - name: Build & push
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile-Monitor
           push: true
-          tags: ghcr.io/${{ github.repository }}:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
