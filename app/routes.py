@@ -55,7 +55,14 @@ def containers():
     for container in client.containers.list(all=True):
         info = {
             "name": container.name,
-            "image": ",".join(container.image.tags) if container.image.tags else container.attrs["Image"][:12],
+            # Read the image name from the container's own inspect data
+            # (Config.Image), NOT container.image.tags: the latter triggers a
+            # GET /images/<id>/json against the docker-socket-proxy, which does
+            # not allowlist the images endpoint and returns 403 — taking the
+            # whole /containers route to a 500 and blinding container liveness
+            # (#5546). Config.Image carries the same tag with no extra API call.
+            "image": container.attrs.get("Config", {}).get("Image")
+            or container.attrs.get("Image", "")[:12],
             "status": container.status,
             "state": container.attrs["State"]["Status"],
         }
