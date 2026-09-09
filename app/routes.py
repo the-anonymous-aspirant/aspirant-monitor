@@ -1,6 +1,7 @@
 import logging
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import docker
@@ -14,6 +15,74 @@ from app.daily_report import generate_report
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Docker's `stats?stream=False` samples twice to compute a CPU delta, so each
+# call costs ~2s at the docker-socket-proxy regardless of container size —
+# unavoidable per call, but fetching them one after another turned a 25-
+# container host into a 49s response (#5618). Cap concurrency rather than
+# spawning one thread per container so a much larger host doesn't open an
+# unbounded number of connections through the proxy in one request.
+_MAX_STATS_WORKERS = 25
+
+_EMPTY_STATS = {
+    "cpu_percent": None,
+    "memory_usage_mb": None,
+    "memory_limit_mb": None,
+    "memory_percent": None,
+    "network_rx_mb": None,
+    "network_tx_mb": None,
+}
+
+
+def _stats_for_running_container(container) -> dict:
+    """Fetch and compute the stats block for one running container.
+
+    Same computation the route used to run inline, unchanged — only
+    extracted so it can be dispatched to a thread pool instead of a serial
+    for-loop.
+    """
+    try:
+        stats = container.stats(stream=False)
+
+        # CPU percentage
+        cpu_delta = (
+            stats["cpu_stats"]["cpu_usage"]["total_usage"]
+            - stats["precpu_stats"]["cpu_usage"]["total_usage"]
+        )
+        system_delta = (
+            stats["cpu_stats"].get("system_cpu_usage", 0)
+            - stats["precpu_stats"].get("system_cpu_usage", 0)
+        )
+        online_cpus = stats["cpu_stats"].get("online_cpus", 1)
+        if system_delta > 0 and cpu_delta >= 0:
+            cpu_percent = round((cpu_delta / system_delta) * online_cpus * 100, 2)
+        else:
+            cpu_percent = 0.0
+
+        # Memory
+        mem_stats = stats.get("memory_stats", {})
+        mem_usage = mem_stats.get("usage", 0)
+        mem_limit = mem_stats.get("limit", 0)
+        cache = mem_stats.get("stats", {}).get("cache", 0)
+        mem_used = mem_usage - cache
+        memory_percent = round(mem_used / mem_limit * 100, 1) if mem_limit > 0 else 0.0
+
+        # Network I/O
+        networks = stats.get("networks", {})
+        rx = sum(n.get("rx_bytes", 0) for n in networks.values())
+        tx = sum(n.get("tx_bytes", 0) for n in networks.values())
+
+        return {
+            "cpu_percent": cpu_percent,
+            "memory_usage_mb": round(mem_used / 1024 / 1024, 1),
+            "memory_limit_mb": round(mem_limit / 1024 / 1024, 1),
+            "memory_percent": memory_percent,
+            "network_rx_mb": round(rx / 1024 / 1024, 2),
+            "network_tx_mb": round(tx / 1024 / 1024, 2),
+        }
+    except Exception as exc:
+        logger.warning("Failed to get stats for %s: %s", container.name, exc)
+        return dict(_EMPTY_STATS)
 
 
 def _get_client():
@@ -52,6 +121,7 @@ def containers():
         return _error(503, "docker_unavailable", str(exc))
 
     results = []
+    running = []  # (index into results, container) for running containers
     for container in client.containers.list(all=True):
         info = {
             "name": container.name,
@@ -88,64 +158,24 @@ def containers():
         else:
             info["uptime"] = ""
 
-        # Get live stats for running containers
         if container.status == "running":
-            try:
-                stats = container.stats(stream=False)
-
-                # CPU percentage
-                cpu_delta = (
-                    stats["cpu_stats"]["cpu_usage"]["total_usage"]
-                    - stats["precpu_stats"]["cpu_usage"]["total_usage"]
-                )
-                system_delta = (
-                    stats["cpu_stats"].get("system_cpu_usage", 0)
-                    - stats["precpu_stats"].get("system_cpu_usage", 0)
-                )
-                online_cpus = stats["cpu_stats"].get("online_cpus", 1)
-                if system_delta > 0 and cpu_delta >= 0:
-                    info["cpu_percent"] = round(
-                        (cpu_delta / system_delta) * online_cpus * 100, 2
-                    )
-                else:
-                    info["cpu_percent"] = 0.0
-
-                # Memory
-                mem_stats = stats.get("memory_stats", {})
-                mem_usage = mem_stats.get("usage", 0)
-                mem_limit = mem_stats.get("limit", 0)
-                cache = mem_stats.get("stats", {}).get("cache", 0)
-                mem_used = mem_usage - cache
-                info["memory_usage_mb"] = round(mem_used / 1024 / 1024, 1)
-                info["memory_limit_mb"] = round(mem_limit / 1024 / 1024, 1)
-                if mem_limit > 0:
-                    info["memory_percent"] = round(mem_used / mem_limit * 100, 1)
-                else:
-                    info["memory_percent"] = 0.0
-
-                # Network I/O
-                networks = stats.get("networks", {})
-                rx = sum(n.get("rx_bytes", 0) for n in networks.values())
-                tx = sum(n.get("tx_bytes", 0) for n in networks.values())
-                info["network_rx_mb"] = round(rx / 1024 / 1024, 2)
-                info["network_tx_mb"] = round(tx / 1024 / 1024, 2)
-            except Exception as exc:
-                logger.warning("Failed to get stats for %s: %s", container.name, exc)
-                info["cpu_percent"] = None
-                info["memory_usage_mb"] = None
-                info["memory_limit_mb"] = None
-                info["memory_percent"] = None
-                info["network_rx_mb"] = None
-                info["network_tx_mb"] = None
+            running.append((len(results), container))
         else:
-            info["cpu_percent"] = None
-            info["memory_usage_mb"] = None
-            info["memory_limit_mb"] = None
-            info["memory_percent"] = None
-            info["network_rx_mb"] = None
-            info["network_tx_mb"] = None
+            info.update(_EMPTY_STATS)
 
         results.append(info)
+
+    # Fetch stats for every running container concurrently instead of one
+    # at a time — each `stats(stream=False)` call costs ~2s regardless, so a
+    # serial loop over N containers took ~2s*N (49s for 25 containers, #5618).
+    if running:
+        max_workers = min(len(running), _MAX_STATS_WORKERS)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            stats_blocks = executor.map(
+                _stats_for_running_container, (c for _, c in running)
+            )
+            for (idx, _container), stats_block in zip(running, stats_blocks):
+                results[idx].update(stats_block)
 
     # Sort: running first, then by name
     results.sort(key=lambda c: (0 if c["status"] == "running" else 1, c["name"]))
