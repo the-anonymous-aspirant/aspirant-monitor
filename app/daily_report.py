@@ -1,8 +1,10 @@
 """Daily health report: collect metrics, format, and send via email."""
 
+import asyncio
 import logging
 import shutil
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import NamedTuple
 
@@ -54,6 +56,59 @@ def _dot(color: str) -> str:
     return f'<span style="color:{hex_color};font-size:18px;">&#9679;</span>'
 
 
+# Docker's `stats?stream=False` samples twice to compute a CPU delta, so each
+# call costs ~2s regardless of container size — a serial loop over 25
+# containers turned the daily-report job into ~50s of blocked event loop
+# (#6621). Cap concurrency rather than spawning one thread per container, same
+# rationale as routes.py's `_MAX_STATS_WORKERS` (kept as a separate constant
+# here, not imported, to avoid a routes<->daily_report import cycle: routes.py
+# already imports `generate_report` from this module for `/report/preview`).
+_MAX_STATS_WORKERS = 25
+
+
+def _stats_for_container(container) -> dict:
+    """Fetch and compute the cpu/mem stats block for one running container.
+
+    Same computation `_collect_container_stats` used to run inline, unchanged
+    — only extracted so it can be dispatched to a thread pool.
+    """
+    try:
+        stats = container.stats(stream=False)
+
+        cpu_delta = (
+            stats["cpu_stats"]["cpu_usage"]["total_usage"]
+            - stats["precpu_stats"]["cpu_usage"]["total_usage"]
+        )
+        system_delta = (
+            stats["cpu_stats"].get("system_cpu_usage", 0)
+            - stats["precpu_stats"].get("system_cpu_usage", 0)
+        )
+        online_cpus = stats["cpu_stats"].get("online_cpus", 1)
+        if system_delta > 0 and cpu_delta >= 0:
+            cpu = f"{(cpu_delta / system_delta) * online_cpus * 100:.1f}%"
+        else:
+            cpu = "0.0%"
+
+        mem_stats = stats.get("memory_stats", {})
+        mem_usage = mem_stats.get("usage", 0)
+        mem_limit = mem_stats.get("limit", 0)
+        cache = mem_stats.get("stats", {}).get("cache", 0)
+        mem_used = mem_usage - cache
+        mem_mb = mem_used / 1024 / 1024
+        mem_limit_mb = mem_limit / 1024 / 1024
+        mem_percent = round(mem_used / mem_limit * 100, 1) if mem_limit > 0 else None
+
+        return {
+            "cpu": cpu,
+            "mem": f"{mem_mb:.0f} MB",
+            "mem_mb": mem_mb,
+            "mem_limit_mb": mem_limit_mb,
+            "mem_percent": mem_percent,
+        }
+    except Exception:
+        return {"cpu": "?", "mem": "?", "mem_mb": None, "mem_limit_mb": None, "mem_percent": None}
+
+
 def _collect_container_stats() -> ContainerStats:
     """Collect stats for all containers.
 
@@ -70,6 +125,7 @@ def _collect_container_stats() -> ContainerStats:
         return ContainerStats(items=[], docker_error=str(exc) or exc.__class__.__name__)
 
     results = []
+    running = []  # (index into results, container) for running containers
     for container in client.containers.list(all=True):
         info = {"name": container.name, "status": container.status}
 
@@ -94,45 +150,8 @@ def _collect_container_stats() -> ContainerStats:
         else:
             info["uptime"] = "-"
 
-        # Live stats for running containers
         if container.status == "running":
-            try:
-                stats = container.stats(stream=False)
-
-                cpu_delta = (
-                    stats["cpu_stats"]["cpu_usage"]["total_usage"]
-                    - stats["precpu_stats"]["cpu_usage"]["total_usage"]
-                )
-                system_delta = (
-                    stats["cpu_stats"].get("system_cpu_usage", 0)
-                    - stats["precpu_stats"].get("system_cpu_usage", 0)
-                )
-                online_cpus = stats["cpu_stats"].get("online_cpus", 1)
-                if system_delta > 0 and cpu_delta >= 0:
-                    info["cpu"] = f"{(cpu_delta / system_delta) * online_cpus * 100:.1f}%"
-                else:
-                    info["cpu"] = "0.0%"
-
-                mem_stats = stats.get("memory_stats", {})
-                mem_usage = mem_stats.get("usage", 0)
-                mem_limit = mem_stats.get("limit", 0)
-                cache = mem_stats.get("stats", {}).get("cache", 0)
-                mem_used = mem_usage - cache
-                mem_mb = mem_used / 1024 / 1024
-                mem_limit_mb = mem_limit / 1024 / 1024
-                info["mem"] = f"{mem_mb:.0f} MB"
-                info["mem_mb"] = mem_mb
-                info["mem_limit_mb"] = mem_limit_mb
-                if mem_limit > 0:
-                    info["mem_percent"] = round(mem_used / mem_limit * 100, 1)
-                else:
-                    info["mem_percent"] = None
-            except Exception:
-                info["cpu"] = "?"
-                info["mem"] = "?"
-                info["mem_mb"] = None
-                info["mem_limit_mb"] = None
-                info["mem_percent"] = None
+            running.append((len(results), container))
         else:
             info["cpu"] = "-"
             info["mem"] = "-"
@@ -141,6 +160,18 @@ def _collect_container_stats() -> ContainerStats:
             info["mem_percent"] = None
 
         results.append(info)
+
+    # Fetch stats for every running container concurrently instead of one at
+    # a time — each `stats(stream=False)` call costs ~2s regardless, so a
+    # serial loop over N containers took ~2s*N.
+    if running:
+        max_workers = min(len(running), _MAX_STATS_WORKERS)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            stats_blocks = executor.map(
+                _stats_for_container, (c for _, c in running)
+            )
+            for (idx, _container), stats_block in zip(running, stats_blocks):
+                results[idx].update(stats_block)
 
     results.sort(key=lambda c: (0 if c["status"] == "running" else 1, c["name"]))
     return ContainerStats(items=results, docker_error=None)
@@ -197,8 +228,14 @@ def _parse_temperature(temp_str: str) -> int | None:
         return None
 
 
-def generate_report() -> str:
-    """Generate the daily report as a plain-text string (email fallback)."""
+def generate_report(stats: ContainerStats | None = None) -> str:
+    """Generate the daily report as a plain-text string (email fallback).
+
+    `stats` lets a caller collect container stats once and pass the same
+    `ContainerStats` to both `generate_report` and `generate_report_html` —
+    self-collects when omitted so existing callers (e.g. routes.py's
+    `/report/preview`) are unaffected.
+    """
     now = datetime.now(timezone.utc)
     lines = [f"Aspirant Daily Report - {now.strftime('%Y-%m-%d')}", ""]
 
@@ -224,7 +261,7 @@ def generate_report() -> str:
     lines.append(f"  Temperature:  {temp}")
     lines.append("")
 
-    stats = _collect_container_stats()
+    stats = stats if stats is not None else _collect_container_stats()
     blindness = _blindness_alert(stats)
     if blindness:
         lines.append(f"[CRITICAL] {blindness}")
@@ -246,8 +283,11 @@ def generate_report() -> str:
     return "\n".join(lines)
 
 
-def generate_report_html() -> str:
-    """Generate the daily report as styled HTML."""
+def generate_report_html(stats: ContainerStats | None = None) -> str:
+    """Generate the daily report as styled HTML.
+
+    `stats` — see `generate_report`; self-collects when omitted.
+    """
     now = datetime.now(timezone.utc)
 
     # Collect all data
@@ -256,7 +296,7 @@ def generate_report_html() -> str:
     disks = _collect_disk_info()
     temp_str = get_temperature()
     temp_c = _parse_temperature(temp_str)
-    stats = _collect_container_stats()
+    stats = stats if stats is not None else _collect_container_stats()
     blindness = _blindness_alert(stats)
     containers = stats.items
     running = sum(1 for c in containers if c["status"] == "running")
@@ -408,10 +448,21 @@ def generate_report_html() -> str:
     return "\n".join(html_parts)
 
 
+def _build_report() -> tuple[str, str]:
+    """Collect container stats once and render both report formats from it.
+
+    Run via `asyncio.to_thread` by `send_daily_report` so the ~2s-per-
+    container docker stats walk (still serialized against the other metric
+    reads even though per-container fetch is now concurrent) never blocks the
+    uvicorn event loop that also serves `/containers` (#6621).
+    """
+    stats = _collect_container_stats()
+    return generate_report(stats), generate_report_html(stats)
+
+
 async def send_daily_report():
     """Generate and send the daily health report."""
     logger.info("Generating daily report...")
-    plain = generate_report()
-    html = generate_report_html()
+    plain, html = await asyncio.to_thread(_build_report)
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     await send_email(f"Aspirant Daily Report - {date_str}", plain, html=html)
