@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import docker
 from docker.errors import DockerException
 from fastapi import APIRouter
+from requests.adapters import HTTPAdapter
 from starlette.responses import JSONResponse
 
 from app.config import DOCKER_SOCKET, MONITOR_VERSION, SERVICE_NAME
@@ -86,7 +87,19 @@ def _stats_for_running_container(container) -> dict:
 
 
 def _get_client():
-    return docker.DockerClient(base_url=DOCKER_SOCKET)
+    # Create docker client and configure connection pool to match _MAX_STATS_WORKERS
+    # Default docker-py pool is 10; with 25 concurrent workers we'd get pool-full
+    # warnings. Match the pool size to the worker count to eliminate the churn.
+    client = docker.DockerClient(base_url=DOCKER_SOCKET)
+
+    # Configure the underlying session's adapters with increased pool size
+    # The session is available once the client is created
+    if hasattr(client, '_client') and hasattr(client._client, 'adapters'):
+        adapter = HTTPAdapter(pool_connections=_MAX_STATS_WORKERS, pool_maxsize=_MAX_STATS_WORKERS)
+        for key in list(client._client.adapters.keys()):
+            client._client.adapters[key] = adapter
+
+    return client
 
 
 def _error(status_code: int, code: str, message: str) -> JSONResponse:
