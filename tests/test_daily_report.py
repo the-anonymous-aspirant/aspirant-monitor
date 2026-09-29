@@ -1,14 +1,18 @@
-from unittest.mock import patch, MagicMock
+import asyncio
+from unittest.mock import patch, AsyncMock, MagicMock
 
+import pytest
 from docker.errors import DockerException
 
 from app.daily_report import (
     ContainerStats,
     _blindness_alert,
+    _build_report,
     _collect_container_stats,
     _status_color,
     generate_report,
     generate_report_html,
+    send_daily_report,
     THRESHOLDS,
 )
 
@@ -266,3 +270,125 @@ class TestReportFailsClosedOnBlindness:
         html = generate_report_html()
         assert "All systems healthy" in html
         assert "Monitor blind" not in html
+
+
+# --- Regression: event loop blocked ~100s at 06:00Z daily report (task 6621,
+# remediated by 6675) ------------------------------------------------------
+#
+# The daily report ran a serial ~2s-per-container docker stats walk twice
+# (once per renderer) directly on the uvicorn event loop, blocking
+# `/containers` for ~100s every day. The tests below guard the fix: stats are
+# fetched concurrently, collected once, and the whole build runs off-loop.
+
+
+def _mock_container(
+    name,
+    cpu_usage=300,
+    precpu_usage=100,
+    system_usage=2000,
+    presystem_usage=1000,
+    online_cpus=1,
+    mem_usage=100 * 1024 * 1024,
+    mem_limit=200 * 1024 * 1024,
+    cache=0,
+):
+    """Build a MagicMock docker container with a realistic `.stats()` payload."""
+    container = MagicMock()
+    container.name = name
+    container.status = "running"
+    container.attrs = {"State": {"StartedAt": "2026-01-01T00:00:00.000000000Z"}}
+    container.stats.return_value = {
+        "cpu_stats": {
+            "cpu_usage": {"total_usage": cpu_usage},
+            "system_cpu_usage": system_usage,
+            "online_cpus": online_cpus,
+        },
+        "precpu_stats": {
+            "cpu_usage": {"total_usage": precpu_usage},
+            "system_cpu_usage": presystem_usage,
+        },
+        "memory_stats": {"usage": mem_usage, "limit": mem_limit, "stats": {"cache": cache}},
+    }
+    return container
+
+
+class TestCollectContainerStatsConcurrency:
+    def test_computes_correct_stats_per_container(self):
+        alpha = _mock_container("alpha", cpu_usage=300, precpu_usage=100, mem_usage=100 * 1024 * 1024, mem_limit=200 * 1024 * 1024)
+        beta = _mock_container("beta", cpu_usage=600, precpu_usage=100, mem_usage=150 * 1024 * 1024, mem_limit=200 * 1024 * 1024)
+
+        with patch("app.daily_report.docker.DockerClient") as mock_ctor:
+            mock_client = MagicMock()
+            mock_client.containers.list.return_value = [alpha, beta]
+            mock_ctor.return_value = mock_client
+            stats = _collect_container_stats()
+
+        assert stats.docker_error is None
+        by_name = {c["name"]: c for c in stats.items}
+        # cpu% = (cpu_delta / system_delta) * online_cpus * 100
+        assert by_name["alpha"]["cpu"] == "20.0%"  # (200/1000)*1*100
+        assert by_name["beta"]["cpu"] == "50.0%"  # (500/1000)*1*100
+        assert by_name["alpha"]["mem_mb"] == pytest.approx(100.0)
+        assert by_name["beta"]["mem_mb"] == pytest.approx(150.0)
+
+    def test_one_container_stats_failure_does_not_affect_others(self):
+        good = _mock_container("good", cpu_usage=300, precpu_usage=100)
+        bad = _mock_container("bad")
+        bad.stats.side_effect = Exception("stats unavailable")
+
+        with patch("app.daily_report.docker.DockerClient") as mock_ctor:
+            mock_client = MagicMock()
+            mock_client.containers.list.return_value = [good, bad]
+            mock_ctor.return_value = mock_client
+            stats = _collect_container_stats()
+
+        by_name = {c["name"]: c for c in stats.items}
+        assert by_name["good"]["cpu"] == "20.0%"
+        assert by_name["bad"]["cpu"] == "?"
+        assert by_name["bad"]["mem_mb"] is None
+
+
+class TestReportsAcceptPrecollectedStats:
+    def test_generate_report_skips_recollection_when_stats_given(self):
+        with patch("app.daily_report._collect_container_stats") as mock_collect:
+            report = generate_report(MOCK_STATS_HEALTHY)
+        mock_collect.assert_not_called()
+        assert "client" in report
+
+    def test_generate_report_html_skips_recollection_when_stats_given(self):
+        with patch("app.daily_report._collect_container_stats") as mock_collect:
+            html = generate_report_html(MOCK_STATS_HEALTHY)
+        mock_collect.assert_not_called()
+        assert "client" in html
+
+
+class TestBuildReportSharesOneStatsCollection:
+    @patch("app.daily_report.get_temperature", return_value=MOCK_METRICS["temp"])
+    @patch("app.daily_report.get_memory", return_value=MOCK_METRICS["memory"])
+    @patch("app.daily_report.get_load_average", return_value=MOCK_METRICS["load"])
+    @patch("app.daily_report.get_uptime", return_value=MOCK_METRICS["uptime"])
+    @patch("app.daily_report._collect_disk_info", return_value=MOCK_METRICS["disk"])
+    @patch("app.daily_report._collect_container_stats", return_value=MOCK_STATS_HEALTHY)
+    def test_collects_stats_exactly_once_for_both_renderers(self, mock_collect, *_):
+        plain, html = _build_report()
+
+        assert mock_collect.call_count == 1
+        assert "client" in plain
+        assert "client" in html
+
+
+class TestSendDailyReportRunsOffLoop:
+    def test_build_runs_via_asyncio_to_thread(self):
+        async def fake_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("app.daily_report.asyncio.to_thread", side_effect=fake_to_thread) as mock_to_thread, \
+             patch("app.daily_report._build_report", return_value=("plain text", "<html></html>")) as mock_build, \
+             patch("app.daily_report.send_email", new_callable=AsyncMock) as mock_send_email:
+            asyncio.run(send_daily_report())
+
+        mock_to_thread.assert_called_once_with(mock_build)
+        mock_send_email.assert_awaited_once()
+        _, call_args, call_kwargs = mock_send_email.mock_calls[0]
+        assert "plain text" in call_args
+        assert call_kwargs.get("html") == "<html></html>"
