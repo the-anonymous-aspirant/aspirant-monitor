@@ -19,7 +19,10 @@ def test_get_client_uses_docker_socket_env(monkeypatch):
 
     with patch("docker.DockerClient") as mock_ctor:
         routes._get_client()
-        mock_ctor.assert_called_once_with(base_url="tcp://docker-socket-proxy:2375")
+        mock_ctor.assert_called_once_with(
+            base_url="tcp://docker-socket-proxy:2375",
+            max_pool_size=routes._MAX_STATS_WORKERS,
+        )
 
 
 def test_get_client_defaults_to_unix_socket(monkeypatch):
@@ -32,7 +35,10 @@ def test_get_client_defaults_to_unix_socket(monkeypatch):
 
     with patch("docker.DockerClient") as mock_ctor:
         routes._get_client()
-        mock_ctor.assert_called_once_with(base_url="unix:///var/run/docker.sock")
+        mock_ctor.assert_called_once_with(
+            base_url="unix:///var/run/docker.sock",
+            max_pool_size=routes._MAX_STATS_WORKERS,
+        )
 
 
 def test_daily_report_collect_uses_docker_socket_env(monkeypatch):
@@ -46,6 +52,9 @@ def test_daily_report_collect_uses_docker_socket_env(monkeypatch):
     with patch("docker.DockerClient") as mock_ctor:
         mock_ctor.return_value.containers.list.return_value = []
         stats = daily_report._collect_container_stats()
-        mock_ctor.assert_called_once_with(base_url="tcp://docker-socket-proxy:2375")
+        mock_ctor.assert_called_once_with(
+            base_url="tcp://docker-socket-proxy:2375",
+            max_pool_size=daily_report._MAX_STATS_WORKERS,
+        )
         assert stats.docker_error is None
         assert stats.items == []
