@@ -118,7 +118,12 @@ def _collect_container_stats() -> ContainerStats:
     `generate_report`/`generate_report_html`), never as "no containers exist".
     """
     try:
-        client = docker.DockerClient(base_url=DOCKER_SOCKET)
+        # docker-py defaults to a 10-connection pool; this fetches up to
+        # _MAX_STATS_WORKERS concurrent stats() calls through this same
+        # client, so an unsized pool logs "Connection pool is full,
+        # discarding connection" warnings once concurrency exceeds 10
+        # (#6621 remediation item 3).
+        client = docker.DockerClient(base_url=DOCKER_SOCKET, max_pool_size=_MAX_STATS_WORKERS)
         client.ping()
     except DockerException as exc:
         logger.error("Docker unavailable for daily report: %s", exc)
