@@ -332,7 +332,11 @@ async def report_send(request: Request):
         return _error(422, "invalid_field", "body must be a non-empty string")
     if html is not None and not isinstance(html, str):
         return _error(422, "invalid_field", "html must be a string when present")
-    if "\n" in subject or "\r" in subject:
+    # One line as Python splits lines: CR, LF, VT, FF, FS, GS, RS, NEL, U+2028
+    # and U+2029 all count, the same set EmailMessage refuses in a header, so
+    # the refusal is a 422 here rather than a 500 there (security review of
+    # PR 13, note 1).
+    if len(subject.splitlines()) != 1:
         return _error(422, "invalid_field", "subject must be a single line")
     if len(subject) > config.REPORT_SEND_MAX_SUBJECT_CHARS:
         return _error(413, "too_large", f"subject exceeds {config.REPORT_SEND_MAX_SUBJECT_CHARS} characters")
