@@ -78,8 +78,10 @@ def test_malformed_bodies_are_refused(client, send_enabled, send_email_mock):
     assert a_list.status_code == 400
     empty_subject = client.post("/report/send", json={"subject": "  ", "body": "b"}, headers=OK)
     assert empty_subject.status_code == 422
-    multiline_subject = client.post("/report/send", json={"subject": "s\nBcc: x@example.com", "body": "b"}, headers=OK)
-    assert multiline_subject.status_code == 422
+    for sep in ("\r\n", "\n", "\x0b", "\x0c", "\x85", "\u2028", "\u2029"):
+        multiline_subject = client.post("/report/send", json={"subject": f"s{sep}Bcc: x@example.com", "body": "b"}, headers=OK)
+        assert multiline_subject.status_code == 422, repr(sep)
+        assert multiline_subject.json()["error"]["message"] == "subject must be a single line"
     html_not_str = client.post("/report/send", json={"subject": "s", "body": "b", "html": 5}, headers=OK)
     assert html_not_str.status_code == 422
     send_email_mock.assert_not_called()
@@ -101,6 +103,13 @@ def test_happy_path_sends_to_the_fixed_recipient_only(client, send_enabled, send
     send_email_mock.assert_awaited_once_with("Weekly report 2026-W43", "Plain text", html="<p>Plain text</p>")
     # The sender takes no recipient: the address is ALERT_EMAIL_TO inside send_email.
     assert "to" not in send_email_mock.call_args.kwargs
+
+
+def test_trailing_separator_is_stripped_not_refused(client, send_enabled, send_email_mock):
+    for sep in ("\n", "\r\n", "\u2028", "  "):
+        resp = client.post("/report/send", json={"subject": f"Weekly report{sep}", "body": "b"}, headers=OK)
+        assert resp.status_code == 202, repr(sep)
+        assert send_email_mock.call_args.args[0] == "Weekly report"
 
 
 def test_smtp_failure_is_502(client, send_enabled):
