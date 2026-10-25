@@ -328,6 +328,10 @@ async def report_send(request: Request):
     html = payload.get("html")
     if not isinstance(subject, str) or not subject.strip():
         return _error(422, "invalid_field", "subject must be a non-empty string")
+    # Surrounding whitespace, a trailing newline included, is dropped rather
+    # than refused: a caller's `"Weekly report\n"` is a subject, not an
+    # injection (security review of PR 14, residual).
+    subject = subject.strip()
     if not isinstance(body, str) or not body.strip():
         return _error(422, "invalid_field", "body must be a non-empty string")
     if html is not None and not isinstance(html, str):
@@ -336,7 +340,7 @@ async def report_send(request: Request):
     # and U+2029 all count, the same set EmailMessage refuses in a header, so
     # the refusal is a 422 here rather than a 500 there (security review of
     # PR 13, note 1).
-    if len(subject.splitlines()) != 1:
+    if subject.splitlines() != [subject]:
         return _error(422, "invalid_field", "subject must be a single line")
     if len(subject) > config.REPORT_SEND_MAX_SUBJECT_CHARS:
         return _error(413, "too_large", f"subject exceeds {config.REPORT_SEND_MAX_SUBJECT_CHARS} characters")

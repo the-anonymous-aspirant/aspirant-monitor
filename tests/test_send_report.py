@@ -105,6 +105,13 @@ def test_happy_path_sends_to_the_fixed_recipient_only(client, send_enabled, send
     assert "to" not in send_email_mock.call_args.kwargs
 
 
+def test_trailing_separator_is_stripped_not_refused(client, send_enabled, send_email_mock):
+    for sep in ("\n", "\r\n", "\u2028", "  "):
+        resp = client.post("/report/send", json={"subject": f"Weekly report{sep}", "body": "b"}, headers=OK)
+        assert resp.status_code == 202, repr(sep)
+        assert send_email_mock.call_args.args[0] == "Weekly report"
+
+
 def test_smtp_failure_is_502(client, send_enabled):
     with patch("app.routes.send_email", new_callable=AsyncMock, return_value=False):
         resp = client.post("/report/send", json={"subject": "s", "body": "b"}, headers=OK)
