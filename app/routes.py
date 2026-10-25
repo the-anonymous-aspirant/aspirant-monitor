@@ -1,3 +1,5 @@
+import hmac
+import json
 import logging
 import os
 import shutil
@@ -6,10 +8,12 @@ from datetime import datetime, timezone
 
 import docker
 from docker.errors import DockerException
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from starlette.responses import JSONResponse
 
+from app import config
 from app.config import DOCKER_SOCKET, MONITOR_VERSION, SERVICE_NAME
+from app.email import send_email
 from app.scheduler import get_scheduler_status
 from app.daily_report import generate_report
 
@@ -268,3 +272,78 @@ def report_status():
 @router.get("/report/preview")
 def report_preview():
     return {"report": generate_report()}
+
+
+# ---- send report (system_3 #8739) -------------------------------------------
+# system_3 emails the operator a published weekly report through the monitor,
+# which already holds the one SMTP secret, so system_3 holds none. The
+# endpoint is deliberately narrow (c53666 on #8712): one fixed recipient
+# (ALERT_EMAIL_TO, never a caller-supplied address), a size cap, and a bearer
+# token that only system_3 presents.
+
+_SEND_REPORT_KEYS = {"subject", "body", "html"}
+
+
+def _send_report_authorized(request: Request) -> bool:
+    """Constant-time check of `Authorization: Bearer <REPORT_SEND_TOKEN>`.
+
+    Reads the token from the config module at call time so a test can patch it.
+    """
+    token = config.REPORT_SEND_TOKEN
+    if not token:
+        return False
+    header = request.headers.get("authorization", "")
+    scheme, _, presented = header.partition(" ")
+    if scheme.lower() != "bearer" or not presented:
+        return False
+    return hmac.compare_digest(presented.strip().encode(), token.encode())
+
+
+@router.post("/report/send", status_code=202)
+async def report_send(request: Request):
+    if not config.REPORT_SEND_TOKEN:
+        return _error(503, "send_disabled", "REPORT_SEND_TOKEN is not configured on the monitor")
+    if not _send_report_authorized(request):
+        return _error(401, "unauthorized", "A valid system_3 bearer token is required")
+    length = request.headers.get("content-length")
+    if length is None or not length.isdigit():
+        return _error(411, "length_required", "Content-Length is required")
+    if int(length) > config.REPORT_SEND_MAX_REQUEST_BYTES:
+        return _error(413, "too_large", f"Request exceeds {config.REPORT_SEND_MAX_REQUEST_BYTES} bytes")
+    raw = await request.body()
+    if len(raw) > config.REPORT_SEND_MAX_REQUEST_BYTES:
+        return _error(413, "too_large", f"Request exceeds {config.REPORT_SEND_MAX_REQUEST_BYTES} bytes")
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return _error(400, "bad_request", "Body must be a JSON object")
+    if not isinstance(payload, dict):
+        return _error(400, "bad_request", "Body must be a JSON object")
+    unknown = sorted(set(payload) - _SEND_REPORT_KEYS)
+    if unknown:
+        # No caller-supplied recipient, ever: the key set is closed.
+        return _error(422, "unknown_field", f"Unknown field(s): {', '.join(unknown)}; the recipient is fixed")
+    subject = payload.get("subject")
+    body = payload.get("body")
+    html = payload.get("html")
+    if not isinstance(subject, str) or not subject.strip():
+        return _error(422, "invalid_field", "subject must be a non-empty string")
+    if not isinstance(body, str) or not body.strip():
+        return _error(422, "invalid_field", "body must be a non-empty string")
+    if html is not None and not isinstance(html, str):
+        return _error(422, "invalid_field", "html must be a string when present")
+    if "\n" in subject or "\r" in subject:
+        return _error(422, "invalid_field", "subject must be a single line")
+    if len(subject) > config.REPORT_SEND_MAX_SUBJECT_CHARS:
+        return _error(413, "too_large", f"subject exceeds {config.REPORT_SEND_MAX_SUBJECT_CHARS} characters")
+    if len(body.encode()) > config.REPORT_SEND_MAX_BODY_BYTES:
+        return _error(413, "too_large", f"body exceeds {config.REPORT_SEND_MAX_BODY_BYTES} bytes")
+    if html is not None and len(html.encode()) > config.REPORT_SEND_MAX_HTML_BYTES:
+        return _error(413, "too_large", f"html exceeds {config.REPORT_SEND_MAX_HTML_BYTES} bytes")
+    if not config.email_enabled():
+        return _error(503, "email_not_configured", "SMTP is not configured on the monitor")
+    sent = await send_email(subject, body, html=html)
+    if not sent:
+        return _error(502, "send_failed", "The monitor could not hand the report to SMTP")
+    logger.info("Report sent on behalf of system_3: %s", subject)
+    return {"sent": True}
