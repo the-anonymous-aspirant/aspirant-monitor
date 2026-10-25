@@ -19,6 +19,17 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "")
 ALERT_EMAIL_FROM = os.getenv("ALERT_EMAIL_FROM", "")
 
+# Send-report endpoint (system_3 #8739): a bearer token that system_3 presents
+# on POST /report/send. Unset = the endpoint is disabled (503), so the route
+# does not exist operationally until the operator provisions the secret in the
+# cell's .env. The recipient is always ALERT_EMAIL_TO; the caps bound what a
+# caller can push through the one configured mailbox.
+REPORT_SEND_TOKEN = os.getenv("REPORT_SEND_TOKEN", "")
+REPORT_SEND_MAX_REQUEST_BYTES = int(os.getenv("REPORT_SEND_MAX_REQUEST_BYTES", str(64 * 1024)))
+REPORT_SEND_MAX_SUBJECT_CHARS = 200
+REPORT_SEND_MAX_BODY_BYTES = 16 * 1024
+REPORT_SEND_MAX_HTML_BYTES = 48 * 1024
+
 # Daily report schedule (hour in CET, 0-23)
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "8"))
 
