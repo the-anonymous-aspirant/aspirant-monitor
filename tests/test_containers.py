@@ -18,7 +18,7 @@ class _ImageProxy403:
         raise APIError("403 Client Error: Forbidden for /images/<id>/json")
 
 
-def _make_container(name, status="running", image_name=None):
+def _make_container(name, status="running", image_name=None, restart_count=0):
     c = MagicMock()
     c.name = name
     c.status = status
@@ -26,6 +26,7 @@ def _make_container(name, status="running", image_name=None):
     c.attrs = {
         "Image": "sha256:abc123",
         "Config": {"Image": image_name or f"ghcr.io/test/{name}:latest"},
+        "RestartCount": restart_count,
         "State": {
             "Status": status,
             "StartedAt": "2026-01-01T00:00:00Z",
@@ -96,6 +97,33 @@ def test_containers_stopped(client, mock_docker):
     container = resp.json()["containers"][0]
     assert container["cpu_percent"] is None
     assert container["memory_usage_mb"] is None
+
+
+def test_containers_report_restart_count_and_started_at(client, mock_docker):
+    """A crash-looping container reads `running` between restarts; the restart
+    count and the current run's start are what expose the loop (system_3 #9119)."""
+    looping = _make_container("tor", restart_count=1369)
+    looping.attrs["State"]["StartedAt"] = "2026-10-29T15:14:14.438722647Z"
+    mock_docker.containers.list.return_value = [
+        looping,
+        _make_container("stopped-svc", status="exited", restart_count=2),
+    ]
+    resp = client.get("/containers")
+    by_name = {c["name"]: c for c in resp.json()["containers"]}
+    assert by_name["tor"]["restart_count"] == 1369
+    assert by_name["tor"]["started_at"] == "2026-10-29T15:14:14.438722647Z"
+    assert by_name["stopped-svc"]["restart_count"] == 2
+    assert by_name["stopped-svc"]["started_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_containers_restart_fields_null_when_docker_omits_them(client, mock_docker):
+    c = _make_container("fresh", status="created")
+    del c.attrs["RestartCount"]
+    c.attrs["State"]["StartedAt"] = ""
+    mock_docker.containers.list.return_value = [c]
+    container = client.get("/containers").json()["containers"][0]
+    assert container["restart_count"] is None
+    assert container["started_at"] is None
 
 
 def test_containers_docker_unavailable(client, mock_docker):

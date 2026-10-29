@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- `/containers` reports `restart_count` (docker's policy restarts since the
+  container was created) and `started_at` (the current run's start) for every
+  container. A crash-looping container reads `running` for most of each cycle,
+  so state alone shows it healthy between restarts. Both fields come from the
+  inspect data the list already reads, so no new socket-proxy endpoint is
+  called. See system_3 task #9119.
 - CI publishes `sha-<short7>` image tags alongside `:latest`, via
   `docker/metadata-action@v5` — the same three tag rules aspirant-server,
   -client and -commander already use. system_3's deploy-freshness sweep
