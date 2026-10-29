@@ -32,7 +32,7 @@ Lightweight sidecar service that exposes system-level metrics for the Aspirant p
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Service health + Docker socket connectivity |
-| `/containers` | GET | Container list with CPU, memory, network stats |
+| `/containers` | GET | Container list with state, restart count, current-run start, CPU, memory, network stats |
 | `/disk` | GET | Disk usage, volume sizes, image summary |
 | `/report/status` | GET | Last report timestamp, next scheduled report time |
 | `/report/preview` | GET | Generate and return the daily report content without sending email (useful for debugging) |

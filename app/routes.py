@@ -143,6 +143,13 @@ def containers():
             or container.attrs.get("Image", "")[:12],
             "status": container.status,
             "state": container.attrs["State"]["Status"],
+            # Policy restarts since the container was created, and when its
+            # current run began. A crash-looping container is `running` for
+            # most of each cycle, so state alone reads it healthy between
+            # restarts; these two let a reader see the loop (system_3 #9119).
+            # Both are in the inspect data list() already returned.
+            "restart_count": container.attrs.get("RestartCount"),
+            "started_at": container.attrs["State"].get("StartedAt") or None,
         }
 
         # Calculate uptime from started_at
