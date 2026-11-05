@@ -21,11 +21,26 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     if: github.ref == 'refs/heads/main'
+    # Image builds of one ref run one at a time, newest last, so two merges
+    # landing seconds apart cannot push :latest out of commit order (system_3
+    # #9966). On this job only: test runs, PR or main, are not queued.
+    concurrency:
+      group: build-image-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+      # The concurrency group above orders main's image builds, but a re-run of
+      # an older commit joins the same queue and would still retag :latest with
+      # it, rolling the deploy back. So the moving tags (:latest, :main) go only
+      # on a build of the commit that is main's head right now; any other build
+      # still pushes its sha- tag. If the head cannot be read, the build fails
+      # rather than guessing (system_3 #9966/#9984; aspirant-client #409).
+      - name: Is this commit main's head?
+        id: head
+        run: bash scripts/is-main-head.sh "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -45,9 +60,9 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ steps.head.outputs.is_head == 'true' }}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ steps.head.outputs.is_head == 'true' }}
       - name: Build & push
         uses: docker/build-push-action@v5
         with:
