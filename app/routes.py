@@ -89,6 +89,24 @@ def _stats_for_running_container(container) -> dict:
         return dict(_EMPTY_STATS)
 
 
+def _image_size_by_id(client) -> dict:
+    """Map each image's full ID to its size in bytes, via the same `df()`
+    call `/disk` already makes (system_3 #10496-A1) — already allowlisted on
+    the docker-socket-proxy, unlike a per-image `/images/<id>/json` inspect
+    (the exact call #5546 found forbidden and this route must still avoid).
+
+    Returns `{}` on any failure, including a malformed response shape — a
+    missing size must read as `disk_mb: null` on every container, never as a
+    crash or a false `0`.
+    """
+    try:
+        df = client.df()
+        return {img["Id"]: img["Size"] for img in df.get("Images", []) if img.get("Id")}
+    except Exception:
+        logger.warning("Failed to read image sizes from df()", exc_info=True)
+        return {}
+
+
 def _get_client():
     # docker-py defaults to a 10-connection pool; /containers dispatches up to
     # _MAX_STATS_WORKERS concurrent stats() calls through this same client, so
@@ -128,9 +146,17 @@ def containers():
     except DockerException as exc:
         return _error(503, "docker_unavailable", str(exc))
 
+    # system_3 #10496-A1: per-container disk, joined by the container's own
+    # full image ID (never a tag string — several containers can share one
+    # tag-less or re-tagged image) against the same df() call /disk already
+    # makes. One call for the whole route, not per container.
+    image_sizes = _image_size_by_id(client)
+
     results = []
     running = []  # (index into results, container) for running containers
     for container in client.containers.list(all=True):
+        image_id = container.attrs.get("Image")
+        image_size_bytes = image_sizes.get(image_id)
         info = {
             "name": container.name,
             # Read the image name from the container's own inspect data
@@ -150,6 +176,10 @@ def containers():
             # Both are in the inspect data list() already returned.
             "restart_count": container.attrs.get("RestartCount"),
             "started_at": container.attrs["State"].get("StartedAt") or None,
+            # The image's own size — several containers sharing one image
+            # report the same figure (shared layers, not double-charged); null
+            # when the image ID isn't in df()'s response rather than a false 0.
+            "disk_mb": round(image_size_bytes / 1024 / 1024, 1) if image_size_bytes is not None else None,
         }
 
         # Calculate uptime from started_at

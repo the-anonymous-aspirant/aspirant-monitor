@@ -126,6 +126,58 @@ def test_containers_restart_fields_null_when_docker_omits_them(client, mock_dock
     assert container["started_at"] is None
 
 
+def test_containers_disk_mb_from_image_size(client, mock_docker):
+    """system_3 #10496-A1: disk_mb joins on the container's own image ID
+    against df()'s Images list, never on the tag string."""
+    mock_docker.df.return_value = {
+        "Images": [
+            {"Id": "sha256:abc123", "Size": 500 * 1024 * 1024},
+            {"Id": "sha256:def456", "Size": 300 * 1024 * 1024},
+        ],
+    }
+    c1 = _make_container("server")  # attrs["Image"] = "sha256:abc123" by default
+    c2 = _make_container("postgres")
+    c2.attrs["Image"] = "sha256:def456"
+    mock_docker.containers.list.return_value = [c1, c2]
+    data = client.get("/containers").json()
+    by_name = {c["name"]: c for c in data["containers"]}
+    assert by_name["server"]["disk_mb"] == 500.0
+    assert by_name["postgres"]["disk_mb"] == 300.0
+
+
+def test_containers_disk_mb_shared_image_not_double_charged(client, mock_docker):
+    mock_docker.df.return_value = {
+        "Images": [{"Id": "sha256:abc123", "Size": 500 * 1024 * 1024}],
+    }
+    # Both containers default to attrs["Image"] = "sha256:abc123" (_make_container).
+    mock_docker.containers.list.return_value = [
+        _make_container("a"),
+        _make_container("b"),
+    ]
+    data = client.get("/containers").json()
+    sizes = {c["name"]: c["disk_mb"] for c in data["containers"]}
+    assert sizes == {"a": 500.0, "b": 500.0}
+
+
+def test_containers_disk_mb_null_when_image_id_unknown(client, mock_docker):
+    mock_docker.df.return_value = {"Images": [{"Id": "sha256:other", "Size": 999}]}
+    mock_docker.containers.list.return_value = [_make_container("orphan")]
+    container = client.get("/containers").json()["containers"][0]
+    assert container["disk_mb"] is None
+
+
+def test_containers_disk_mb_null_when_df_unavailable(client, mock_docker):
+    """The /containers route itself must not degrade when df() does — the
+    existing containers() behaviour (name, state, stats) is unaffected."""
+    mock_docker.df.side_effect = DockerException("proxy hiccup")
+    mock_docker.containers.list.return_value = [_make_container("server")]
+    resp = client.get("/containers")
+    assert resp.status_code == 200
+    container = resp.json()["containers"][0]
+    assert container["disk_mb"] is None
+    assert container["name"] == "server"
+
+
 def test_containers_docker_unavailable(client, mock_docker):
     from app.routes import _get_client
     from unittest.mock import patch
