@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- `/containers` reports `disk_mb` per container — the size of its own image,
+  joined by the container's full image ID against the same `df()` call
+  `/disk` already makes, so two containers sharing one image report the same
+  figure rather than double-charging it. `null` when the image ID isn't in
+  `df()`'s response, never a false `0`. System_3 task #10496-A1, feeding the
+  per-service usage rollup (#10490-C).
 - Builds of main's image now run one at a time, and `:latest` and `:main` go
   only on a build of main's current head (`scripts/is-main-head.sh`, unit test
   `sh tests/is_main_head_unit.sh`). Two merges landing seconds apart, or a
