@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import docker
-from docker.errors import DockerException
+from docker.errors import APIError, DockerException, NotFound
 from fastapi import APIRouter, Request
 from starlette.responses import JSONResponse
 
@@ -392,3 +392,86 @@ async def report_send(request: Request):
         return _error(502, "send_failed", "The monitor could not hand the report to SMTP")
     logger.info("Report sent on behalf of system_3: %s", subject)
     return {"sent": True}
+
+
+# ---- container start/stop (system_3 #10491-A / #10514) ----------------------
+# A gated admin control over which served containers may be started/stopped --
+# never this cell's own infrastructure, no matter what the write-scoped proxy
+# itself would permit (it has no name filter of its own). Same bearer-token
+# shape as /report/send above, a distinct secret and caller (aspirant-server's
+# admin routes).
+
+
+def _get_write_client() -> docker.APIClient:
+    # Low-level client, deliberately not docker.DockerClient: the high-level
+    # client's .containers.get(name) issues a GET /containers/<name>/json to
+    # resolve a Container object before start()/stop() can be called on it,
+    # and the write-scoped proxy's CONTAINERS=0 refuses that GET outright
+    # (researched against the proxy's own haproxy.cfg, #10514). APIClient's
+    # start(name)/stop(name) take the raw name and issue the POST directly,
+    # no prior read.
+    return docker.APIClient(base_url=config.DOCKER_SOCKET_WRITE)
+
+
+def _control_authorized(request: Request) -> bool:
+    """Constant-time check of `Authorization: Bearer <CONTROL_TOKEN>`."""
+    token = config.CONTROL_TOKEN
+    if not token:
+        return False
+    header = request.headers.get("authorization", "")
+    scheme, _, presented = header.partition(" ")
+    if scheme.lower() != "bearer" or not presented:
+        return False
+    return hmac.compare_digest(presented.strip().encode(), token.encode())
+
+
+def _control_request(request: Request, name: str, action: str):
+    """Shared preflight for /containers/{name}/start and /stop.
+
+    Returns an error JSONResponse to send back immediately, or None when the
+    caller is authorized and `name` is on the allowlist and it is safe to
+    proceed. The allowlist check happens before any call reaches
+    DOCKER_SOCKET_WRITE -- a disallowed name never generates outbound traffic
+    at all, so there is nothing for the proxy's own (name-blind) rules to
+    even consider refusing or allowing.
+    """
+    if not config.DOCKER_SOCKET_WRITE or not config.CONTROL_TOKEN:
+        return _error(503, "control_disabled", "Container control is not configured on the monitor")
+    if not _control_authorized(request):
+        return _error(401, "unauthorized", "A valid control bearer token is required")
+    if name not in config.CONTROLLABLE_CONTAINERS:
+        logger.warning("Refused %s on disallowed container name: %s", action, name)
+        return _error(403, "not_controllable", f"{name} is not on the controllable-container allowlist")
+    return None
+
+
+@router.post("/containers/{name}/start", status_code=202)
+def container_start(name: str, request: Request):
+    refusal = _control_request(request, name, "start")
+    if refusal is not None:
+        return refusal
+    try:
+        _get_write_client().start(container=name)
+    except NotFound:
+        return _error(404, "not_found", f"No container named {name}")
+    except APIError as exc:
+        logger.warning("start(%s) failed: %s", name, exc)
+        return _error(502, "docker_error", "The Docker API refused the start")
+    logger.info("Container started via admin control: %s", name)
+    return {"name": name, "action": "start", "accepted": True}
+
+
+@router.post("/containers/{name}/stop", status_code=202)
+def container_stop(name: str, request: Request):
+    refusal = _control_request(request, name, "stop")
+    if refusal is not None:
+        return refusal
+    try:
+        _get_write_client().stop(container=name)
+    except NotFound:
+        return _error(404, "not_found", f"No container named {name}")
+    except APIError as exc:
+        logger.warning("stop(%s) failed: %s", name, exc)
+        return _error(502, "docker_error", "The Docker API refused the stop")
+    logger.info("Container stopped via admin control: %s", name)
+    return {"name": name, "action": "stop", "accepted": True}

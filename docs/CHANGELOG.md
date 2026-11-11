@@ -1,6 +1,19 @@
 # Changelog
 
 ## Unreleased
+- `POST /containers/{name}/start` and `/stop` — a gated admin control over
+  which served containers may be started/stopped (system_3 #10491-A /
+  #10514). Three layers, each independent: a bearer token (`CONTROL_TOKEN`,
+  unset = the endpoints are disabled, same convention as `/report/send`), a
+  hard in-code allowlist (`CONTROLLABLE_CONTAINERS`) that refuses a
+  disallowed name before any Docker API call goes out — this cell's own
+  serving path (server, both client slots, postgres, monitor itself, both
+  docker-socket-proxy sidecars) is never on it, regardless of what the proxy
+  itself would permit — and a second, write-scoped `docker-socket-proxy`
+  sidecar (`DOCKER_SOCKET_WRITE`, compose-side) carrying only
+  `ALLOW_START`/`ALLOW_STOP`, no `CONTAINERS`. Uses `docker.APIClient` (low-
+  level), not `docker.DockerClient`: the high-level client resolves a
+  container via a GET the write-proxy's `CONTAINERS=0` refuses.
 - `/containers` reports `disk_mb` per container — the size of its own image,
   joined by the container's full image ID against the same `df()` call
   `/disk` already makes, so two containers sharing one image report the same
