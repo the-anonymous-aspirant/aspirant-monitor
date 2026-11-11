@@ -17,3 +17,11 @@ def mock_docker():
         mock_client = MagicMock()
         mock_fn.return_value = mock_client
         yield mock_client
+
+
+@pytest.fixture
+def mock_write_docker():
+    with patch("app.routes._get_write_client") as mock_fn:
+        mock_client = MagicMock()
+        mock_fn.return_value = mock_client
+        yield mock_client

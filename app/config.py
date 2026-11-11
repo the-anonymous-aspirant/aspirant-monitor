@@ -30,6 +30,44 @@ REPORT_SEND_MAX_SUBJECT_CHARS = 200
 REPORT_SEND_MAX_BODY_BYTES = 16 * 1024
 REPORT_SEND_MAX_HTML_BYTES = 48 * 1024
 
+# Container start/stop (system_3 #10491-A / #10514): a second, write-scoped
+# docker-socket-proxy sidecar (compose service docker-socket-proxy-write;
+# see its own comment for why it is not the same sidecar as DOCKER_SOCKET
+# above). Same bearer-token shape as REPORT_SEND_TOKEN just above, but a
+# distinct secret and a distinct caller (aspirant-server's admin routes, not
+# system_3) -- unset = the endpoints are disabled (503), same convention.
+DOCKER_SOCKET_WRITE = os.getenv("DOCKER_SOCKET_WRITE", "")
+CONTROL_TOKEN = os.getenv("CONTROL_TOKEN", "")
+
+# The hard allowlist of container names this service will start/stop, no
+# matter what the write-proxy itself would permit (it has no name filter of
+# its own -- see #10514). Deliberately an allowlist of what MAY be
+# controlled, not a denylist of what may not: an unlisted name refuses
+# closed. Excludes this cell's own serving path (server, both client
+# slots, postgres, monitor itself, both docker-socket-proxy sidecars) --
+# stopping any of those would either take down the admin page asking for
+# the stop, or the data every other service depends on. Covers the
+# services report 877 (system_3 #10306) named as disable-for-now
+# candidates, plus their tied dependents.
+CONTROLLABLE_CONTAINERS = frozenset(
+    {
+        "aspirant-online-advisor-1",
+        "aspirant-online-browser-1",
+        "aspirant-online-tor-1",
+        "aspirant-online-translator-1",
+        "aspirant-online-transcriber-1",
+        "aspirant-online-ollama-1",
+        "aspirant-online-penpot-frontend-1",
+        "aspirant-online-penpot-backend-1",
+        "aspirant-online-penpot-postgres-1",
+        "aspirant-online-penpot-redis-1",
+        "aspirant-online-penpot-exporter-1",
+        "aspirant-online-histoire-1",
+        "aspirant-online-explorer-1",
+        "aspirant-online-explorer-api-1",
+    }
+)
+
 # Daily report schedule (hour in CET, 0-23)
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "8"))
 
