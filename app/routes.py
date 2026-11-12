@@ -237,8 +237,8 @@ def disk():
     # Filesystems: root + any extra mounts (e.g. /host/data for RAID)
     disks = []
     mounts = [("/", "System (SSD)")]
-    if os.path.isdir("/host/data"):
-        mounts.append(("/host/data", "Data (RAID1)"))
+    if os.path.isdir(config.HOST_DATA):
+        mounts.append((config.HOST_DATA, "Data (RAID1)"))
 
     for path, label in mounts:
         usage = shutil.disk_usage(path)
@@ -266,26 +266,46 @@ def disk():
             "ref_count": v.get("UsageData", {}).get("RefCount", 0),
         })
 
-    # Bind mount directories on /data/aspirant (visible at /host/data/aspirant)
-    bind_base = "/host/data/aspirant"
+    # Bind mount directories on /data/aspirant (visible at HOST_DATA/aspirant).
+    # os.walk silently skips a directory it cannot enter, which would read a
+    # partly-unreadable tree as a smaller number rather than as unknown. An
+    # onerror callback instead flags the whole directory unreadable, so the
+    # page can say so rather than print a silent 0 MB or undercount.
+    bind_base = os.path.join(config.HOST_DATA, "aspirant")
     if os.path.isdir(bind_base):
         for name in sorted(os.listdir(bind_base)):
             dirpath = os.path.join(bind_base, name)
             if os.path.isdir(dirpath):
                 total = 0
-                for root, _dirs, files in os.walk(dirpath):
+                unreadable = False
+
+                def _mark_unreadable(_exc):
+                    nonlocal unreadable
+                    unreadable = True
+
+                for root, _dirs, files in os.walk(dirpath, onerror=_mark_unreadable):
                     total += sum(
                         os.path.getsize(os.path.join(root, f))
                         for f in files
                         if os.path.isfile(os.path.join(root, f))
                     )
-                volumes.append({
-                    "name": f"/data/aspirant/{name}",
-                    "size_mb": round(total / 1024 / 1024, 1),
-                    "ref_count": -1,
-                })
+                if unreadable:
+                    volumes.append({
+                        "name": f"/data/aspirant/{name}",
+                        "size_mb": None,
+                        "unreadable": True,
+                        "ref_count": -1,
+                    })
+                else:
+                    volumes.append({
+                        "name": f"/data/aspirant/{name}",
+                        "size_mb": round(total / 1024 / 1024, 1),
+                        "ref_count": -1,
+                    })
 
-    volumes.sort(key=lambda v: v["size_mb"], reverse=True)
+    # An unreadable size is unknown, not small: sort it after every readable
+    # one rather than letting None crash the comparison or sort first.
+    volumes.sort(key=lambda v: (v["size_mb"] is None, -(v["size_mb"] or 0)))
 
     # Images summary
     images = df.get("Images", [])

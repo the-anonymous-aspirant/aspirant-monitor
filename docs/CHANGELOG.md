@@ -1,6 +1,14 @@
 # Changelog
 
 ## Unreleased
+- `/disk`'s per-directory bind-mount sizes (`/data/aspirant/*`) now report
+  `{size_mb: null, unreadable: true}` for a directory this process cannot
+  enter, instead of silently reading it as 0 MB — `os.walk` used to skip an
+  unreadable directory with no signal at all (system_3 #10568-A2, ahead of
+  #10568-A3 dropping monitor's root capabilities). A partly unreadable tree
+  reads as unreadable, never as a smaller number. The host mount path moved
+  to `HOST_DATA` (env, default `/host/data`), alongside the existing
+  `HOST_PROC`/`HOST_SYS`, so a test can point it at a scratch directory.
 - `POST /containers/{name}/start` and `/stop` — a gated admin control over
   which served containers may be started/stopped (system_3 #10491-A /
   #10514). Three layers, each independent: a bearer token (`CONTROL_TOKEN`,

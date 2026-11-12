@@ -74,6 +74,7 @@ DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "8"))
 # Host paths for system metrics (mounted read-only from host)
 HOST_PROC = os.getenv("HOST_PROC", "/host/proc")
 HOST_SYS = os.getenv("HOST_SYS", "/host/sys")
+HOST_DATA = os.getenv("HOST_DATA", "/host/data")
 
 
 def email_enabled() -> bool:
