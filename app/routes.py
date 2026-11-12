@@ -180,6 +180,14 @@ def containers():
             # report the same figure (shared layers, not double-charged); null
             # when the image ID isn't in df()'s response rather than a false 0.
             "disk_mb": round(image_size_bytes / 1024 / 1024, 1) if image_size_bytes is not None else None,
+            # Whether /containers/{name}/start|stop will accept this name
+            # (system_3 #10491-E). The allowlist itself must not be copied
+            # into a client (security review of #10558, c65887): a client
+            # shows the control only where this reads true, and still
+            # handles the POST's own 403 not_controllable / 503
+            # control_disabled if the allowlist or config change between
+            # reads.
+            "controllable": container.name in config.CONTROLLABLE_CONTAINERS,
         }
 
         # Calculate uptime from started_at
