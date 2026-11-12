@@ -185,3 +185,36 @@ def test_containers_docker_unavailable(client, mock_docker):
     with patch("app.routes._get_client", side_effect=DockerException("gone")):
         resp = client.get("/containers")
     assert resp.status_code == 503
+
+
+def test_containers_controllable_matches_allowlist(client, mock_docker):
+    """system_3 #10491-E: the client gates its start/stop control strictly on
+    this field, per security review of #10558 (c65887) -- the allowlist
+    itself must stay server-side, so the client never re-derives it."""
+    from app import config
+
+    allowed = next(iter(config.CONTROLLABLE_CONTAINERS))
+    mock_docker.containers.list.return_value = [
+        _make_container(allowed),
+        _make_container("aspirant-online-server-1"),
+        _make_container("aspirant-online-postgres-1"),
+    ]
+    data = client.get("/containers").json()
+    controllable = {c["name"]: c["controllable"] for c in data["containers"]}
+    assert controllable[allowed] is True
+    assert controllable["aspirant-online-server-1"] is False
+    assert controllable["aspirant-online-postgres-1"] is False
+
+
+def test_containers_controllable_covers_every_allowlisted_name(client, mock_docker):
+    """Every one of the 14 allowlisted names reads controllable True, and
+    none outside the allowlist does -- not just the one sampled above."""
+    from app import config
+
+    mock_docker.containers.list.return_value = [
+        _make_container(name) for name in config.CONTROLLABLE_CONTAINERS
+    ] + [_make_container("aspirant-online-server-1"), _make_container("aspirant-online-proxy-1")]
+    data = client.get("/containers").json()
+    for c in data["containers"]:
+        expected = c["name"] in config.CONTROLLABLE_CONTAINERS
+        assert c["controllable"] is expected, c["name"]
