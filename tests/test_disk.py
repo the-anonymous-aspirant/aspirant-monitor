@@ -1,5 +1,7 @@
 import os
 from unittest.mock import patch
+
+import pytest
 from docker.errors import DockerException
 
 from app import config
@@ -35,6 +37,7 @@ def test_disk_docker_unavailable(client, mock_docker):
     assert resp.status_code == 503
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses the chmod 0o000 this test relies on")
 def test_disk_unreadable_bind_directory_reported_unreadable(client, mock_docker, tmp_path, monkeypatch):
     mock_docker.df.return_value = {"Volumes": [], "Images": []}
     bind_base = tmp_path / "aspirant"
